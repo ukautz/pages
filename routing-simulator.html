@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Routing Sim</title>
+</head>
+<script src="http://ajax.googleapis.com/ajax/libs/jquery/1.9.1/jquery.min.js"></script>
+<script src="http://netdna.bootstrapcdn.com/twitter-bootstrap/2.3.0/js/bootstrap.min.js"></script>
+<script type="text/javascript">
+$(function() {
+    var nodeMarginFac = 0.1,
+        procMarginFac = 0.1,
+        settings = {},
+        simInterval = null,
+        nodeList = [],
+        queueCount = 0,
+        requestCount = 0,
+        timeoutCount = 0,
+        tickTime = 100,
+        running = false,
+        assignMethod = null,
+        balancePostion = -1,
+        longestRequestTime = 0,
+        avgRequestTime = 0,
+        longestWaitTime = 0,
+        longestWaitTimePercent = 0,
+        avgRequestTimeTotalCount = 0,
+        avgRequestTimeTotalSum = 0,
+        avgWaitTimeTotalCount = 0,
+        avgWaitTimeTotalSum = 0;
+    
+    var assignMethods = {
+        intelligent: function (requestTime) {
+            var procRes = null, minRequests = -1;
+            
+            INTELLIGENT_NODE:
+            for (var n = 0; n < nodeList.length; n++) {
+                
+                for (var p = 0; p < nodeList[n].procs.length; p++) {
+                    var proc = nodeList[n].procs[p];
+                    var requests = proc.requests.length;
+                    if (requests == 0) {
+                        procRes = proc;
+                        break INTELLIGENT_NODE;
+                    } else if (proc.lockDuration + requestTime >= settings.maxQueueTime) {
+                        continue;
+                    } else if (minRequests == -1 || requests < minRequests) {
+                        procRes = proc;
+                        minRequests = requests;
+                    }
+                }
+            }
+            if (procRes != null) {
+                procRes.lockDuration += requestTime;
+                procRes.requests.push(requestTime);
+                return procRes;
+            } else {
+                return null;
+            }
+        },
+        forsight: function (requestTime) {
+            var procRes = null, minLockDuration = -1;
+            
+            FORSIGHT_NODE:
+            for (var n = 0; n < nodeList.length; n++) {
+                
+                for (var p = 0; p < nodeList[n].procs.length; p++) {
+                    var proc = nodeList[n].procs[p];
+                    if (proc.lockDuration + requestTime > settings.maxQueueTime) {
+                        continue;
+                    }
+                    if (proc.lockDuration == 0) {
+                        procRes = proc;
+                        break FORSIGHT_NODE;
+                    } else if (minLockDuration == -1 || proc.lockDuration < minLockDuration) {
+                        procRes = proc;
+                        minLockDuration = proc.lockDuration;
+                    }
+                }
+            }
+            if (procRes != null) {
+                procRes.lockDuration += requestTime;
+                procRes.requests.push(requestTime);
+                return procRes;
+            } else {
+                return null;
+            }
+        },
+        balanced: function (requestTime) {
+            balancePostion ++;
+            if (balancePostion >= settings.nodes * settings.procsPerNode) {
+                balancePostion = 0;
+            }
+            var nodeNum = Math.floor(balancePostion / settings.procsPerNode);
+            var procNum = balancePostion % settings.procsPerNode;
+            var proc = nodeList[nodeNum].procs[procNum];
+            if (proc.lockDuration + requestTime <= settings.maxQueueTime) {
+                proc.lockDuration += requestTime;
+                proc.requests.push(requestTime);
+                return proc;
+            } else {
+                return null;
+            }
+        },
+        random: function (requestTime) {
+            var pos = Math.floor(Math.random() * settings.nodes * settings.procsPerNode);
+            var nodeNum = Math.floor(pos / settings.procsPerNode);
+            var procNum = pos % settings.procsPerNode;
+            var proc = nodeList[nodeNum].procs[procNum];
+            if (proc.lockDuration + requestTime <= settings.maxQueueTime) {
+                proc.lockDuration += requestTime;
+                proc.requests.push(requestTime);
+                return proc;
+            } else {
+                return null;
+            }
+        }
+    };
+    
+    function readSettings() {
+        $(['nodes', 'procsPerNode', 'reqsPerSec', 'durationReqMin', 'durationReqMax', 'maxQueueTime']).each(function() {
+            var val = parseInt($('input[name='+ this+ ']').val());
+            if (val < 1) {
+                val = 1;
+                $('input[name='+ this+ ']').val(1);
+            }
+            settings[this] = val;
+        });
+        if (settings.durationReqMin > settings.durationReqMax) {
+            var max = settings.durationReqMin;
+            settings.durationReqMin = settings.durationReqMax;
+            settings.durationReqMax = max;
+            $('input[name=durationReqMin]').val(settings.durationReqMin);
+            $('input[name=durationReqMax]').val(settings.durationReqMax);
+        }
+        settings['timeFactor'] = parseFloat($('input[name=timeFactor]').val());
+        if (settings.timeFactor < 0.05) {
+            settings.timeFactor = 0.05;
+            $('input[name=timeFactor]').val(settings.timeFactor.toFixed(2));
+        }
+        settings['assignMethod'] = $('input[name=assignMethod]:checked').val();
+        assignMethod = assignMethods[settings.assignMethod];
+        console.debug(settings);
+    }
+    
+    function initGraph() {
+        $('#sim').empty();
+        nodeList = [];
+        
+        var nodeWidth = 99 / settings.nodes;
+        var nodeMargin = nodeWidth * nodeMarginFac;
+        var procWidth = 99 / settings.procsPerNode;
+        var procMargin = procWidth * procMarginFac;
+        
+        for (var n = 0; n < settings.nodes; n++) {
+            var nodeHtml = $('<div class="node" />');
+            nodeHtml.css({
+                left: (n * nodeWidth + nodeMargin/2)+ '%',
+                width: (nodeWidth - nodeMargin)+ '%'
+            });
+            var procList = [];
+            for (var p = 0; p < settings.procsPerNode; p++) {
+                var procHtml = $('<div class="proc" />');
+                procHtml.css({
+                    left: (p * procWidth + procMargin/2)+ '%',
+                    width: (procWidth - procMargin)+ '%'
+                });
+                nodeHtml.append(procHtml);
+                procList.push({html: procHtml, lockDuration: 0, requests: [], num: p});
+            }
+            nodeList.push({procs: procList, num: n});
+            $('#sim').append(nodeHtml);
+        }
+        
+        return false;
+    }
+    
+    function runSim() {
+        if (simInterval != null) {
+            clearInterval(simInterval);
+        }
+        var lastTick = (new Date()).getTime() * settings.timeFactor;
+        var last = Math.floor(lastTick/1000);
+        simInterval = setInterval(function() {
+            var curTick = (new Date()).getTime() * settings.timeFactor;
+            var cur = Math.floor(curTick/1000);
+            var isRequest = false,
+                avgRequestTimeCur = 0;
+            if (cur > last) {
+                isRequest = true;
+                last = cur;
+                queueCount += settings.reqsPerSec;
+                requestCount += settings.reqsPerSec;
+            }
+            
+            if (queueCount > 0) {
+                var procsFound = 0, sumRequestTime = 0;
+                for (var i = 0; i < queueCount; i++) {
+                    var requestTime = Math.round(Math.random() * (settings.durationReqMax - settings.durationReqMin) + settings.durationReqMin);
+                    sumRequestTime += requestTime;
+                    if (requestTime > longestRequestTime) {
+                        longestRequestTime = requestTime;
+                        $('#longestRequestTime').text((longestRequestTime).toFixed(2));
+                    }
+                    var foundProc = assignMethod(requestTime);
+                    if (foundProc !== null) {
+                        if (foundProc.lockDuration > longestWaitTime) {
+                            longestWaitTime = foundProc.lockDuration;
+                            $('#longestWaitTime').text((longestWaitTime).toFixed(2));
+                        }
+                        procsFound ++;
+                    } else {
+                        break;
+                    }
+                }
+                avgRequestTimeCur = sumRequestTime / queueCount;
+                if (avgRequestTimeCur > avgRequestTime) {
+                    avgRequestTime = avgRequestTimeCur;
+                    $('#maxAvgRequestTime').text(avgRequestTime.toFixed(2));
+                }
+                queueCount -= procsFound;
+                console.debug("QUEUE COUNT", queueCount, "AFTER PROCS FOUND", procsFound);
+                if (queueCount > 0) {
+                    timeoutCount += queueCount;
+                    queueCount = 0;
+                }
+            }
+            
+            var diffTick = Math.round((curTick - lastTick)),
+                freeProcs = 0,
+                sumWaitTime = 0.0;
+            $(nodeList).each(function() {
+                var node = this;
+                $(node.procs).each(function() {
+                    var proc = this;
+                    if (proc.lockDuration == 0) {
+                        proc.requests = [];
+                        freeProcs ++;
+                        return;
+                    }
+                    
+                    sumWaitTime += proc.lockDuration;
+                    proc.lockDuration -= diffTick;
+                    proc.requests[0] -= diffTick;
+                    if (proc.lockDuration < 0) {
+                        proc.lockDuration = 0;
+                    }
+                    if (proc.lockDuration == 0) {
+                        proc.requests = [];
+                        freeProcs ++;
+                    } else {
+                        while (proc.requests.length > 0 && proc.requests[0] <= 0) {
+                            var overhead = proc.requests[0];
+                            proc.requests.shift();
+                            proc.requests[0] += overhead;
+                        }
+                    }
+                    
+                    var ratio = proc.lockDuration / settings.maxQueueTime;
+                    var bgColor = 'rgb('+ Math.ceil(ratio*155 + 100)+ ',100,100)';
+                    proc.html.css({
+                        height: (5+ 95 * (proc.lockDuration/settings.maxQueueTime))+ '%',
+                        backgroundColor: bgColor
+                    });
+                });
+            });
+            lastTick = curTick;
+            $('#timeoutCount').text(timeoutCount+ " ")
+                .append("<small>("+ (timeoutCount * 100 / requestCount).toFixed(2)+ '%</small>)');
+            $('#freeProcs').text(freeProcs);
+            var avgWaitTimeCur = sumWaitTime / (settings.nodes * settings.procsPerNode);
+            if (isRequest) {
+                
+                // request
+                avgRequestTimeTotalCount ++;
+                avgRequestTimeTotalSum += avgRequestTimeCur;
+                var avgRequestTimeTotalAvg = avgRequestTimeTotalSum / avgRequestTimeTotalCount;
+                $('#avgRequestTime').text(avgRequestTimeCur.toFixed(2));
+                $('#avgRequestTimeTotal').text(avgRequestTimeTotalAvg.toFixed(2));
+                
+                // wait
+                avgWaitTimeTotalCount ++;
+                avgWaitTimeTotalSum += avgWaitTimeCur;
+                var avgWaitTimeTotalAvg = avgWaitTimeTotalSum / avgWaitTimeTotalCount;
+                var waitTimePercent = avgWaitTimeCur * 100 / avgRequestTimeCur - 100;
+                var waitTimeTotalPercent = avgWaitTimeTotalAvg * 100 / avgRequestTimeTotalAvg - 100;
+                $('#avgWaitTime').text(avgWaitTimeCur.toFixed(2)+ " ")
+                    .append("<small>(+"+ (waitTimePercent).toFixed(2)+ "%)</small>");
+                $('#avgWaitTimeTotal').text((avgWaitTimeTotalSum / avgWaitTimeTotalCount).toFixed(2)+ ' ')
+                    .append('<small>(+'+ waitTimeTotalPercent.toFixed(2)+ '%)</small>');
+                
+                if (waitTimePercent > longestWaitTimePercent) {
+                    longestWaitTimePercent = waitTimePercent;
+                    $('#longestWaitTimePercent').text('+'+ longestWaitTimePercent.toFixed(2)+ "%");
+                }
+                
+                $('#requestCount').text(requestCount);
+            }
+        }, tickTime);
+    }
+    
+    $('form button').click(function() {
+        if (running) {
+            clearInterval(simInterval);
+            running = false;
+            balancePostion = 0;
+            avgRequestTime = 0;
+            avgRequestTimeTotalCount = 0;
+            avgRequestTimeTotalSum = 0;
+            avgWaitTimeTotalCount = 0;
+            avgWaitTimeTotalSum = 0;
+            longestRequestTime = 0;
+            longestWaitTime = 0;
+            longestWaitTimePercent = 0;
+            requestCount = 0;
+            timeoutCount = 0;
+            $(this).text('Restart');
+        } else {
+            readSettings();
+            initGraph();
+            runSim();
+            running = true;
+            $(this).text('Stop');
+        }
+    }); 
+    
+});
+</script>
+
+<link href="http://netdna.bootstrapcdn.com/twitter-bootstrap/2.3.0/css/bootstrap-combined.min.css" rel="stylesheet">
+
+<style type="text/css">
+#sim {
+    position: relative;
+    height: 300px;
+}
+#sim .pre {
+    background: #666;
+    height: 100%;
+}
+#sim .pre * {
+    position: absolute;
+    bottom: 45%;
+    text-align: center;
+    width: 100%;
+    color: white;
+}
+#sim .node {
+    position: absolute;
+    bottom: 0;
+    background: #000;
+    height: 100%;
+}
+#sim .node:hover {
+    background: #336;
+}
+#sim .node .proc  {
+    position: absolute;
+    bottom: 0;
+    background: #aaa;
+    min-height: 5%;
+}
+</style>
+<body>
+    <div class="container">
+        <div class="row">
+            <div class="span12">
+                <h1>Balancing Simulater</h1>
+            </div>
+            <div class="span3">
+                <form>
+                    <h4>Settings</h4>
+                    <label># Nodes</label>
+                    <input type="text" name="nodes" value="4">
+                        
+                    <label># Process / Node</label>
+                    <input type="text" name="procsPerNode" value="4">
+                    
+                    <label># Requests / sec</label>
+                    <input type="text" name="reqsPerSec" value="16">
+                    
+                    <label># Duration request min ms</label>
+                    <input type="text" name="durationReqMin" value="500">
+                    
+                    <label># Duration request max ms</label>
+                    <input type="text" name="durationReqMax" value="1500">
+                    
+                    <label># Timeout ms</label>
+                    <input type="text" name="maxQueueTime" value="10000">
+                    
+                    <label># Time multiplier</label>
+                    <input type="text" name="timeFactor" value="2.00">
+                </form>
+            </div>
+            <div class="span3">
+                <form>
+                    <h4>Balancing method</h4>
+                    <label class="radio">
+                        <input type="radio" value="intelligent" name="assignMethod" checked="checked">
+                        intelligent
+                        <span class="help-block">
+                            Distributes request to process with least requests in queue.
+                        </span>
+                    </label>
+                    <label class="radio">
+                        <input type="radio" value="forsight" name="assignMethod">
+                        forsight
+                        <span class="help-block">
+                            Distributes requests to processed with the least request/response time ahead. Has knowledge of future requests/response durations.
+                        </span>
+                    </label>
+                    <label class="radio">
+                        <input type="radio" value="balanced" name="assignMethod">
+                        round-robin
+                        <span class="help-block">
+                            Distributes requests equally balanced over all processes.
+                        </span>
+                    </label>
+                    <label class="radio">
+                        <input type="radio" value="random" name="assignMethod">
+                        random
+                        <span class="help-block">
+                            Distributes requests to randomly selected processes.
+                        </span>
+                    </label>
+                    <div class="form-actions">
+                        <button class="btn btn-primary btn-large" type="button">Start</button>
+                    </div>
+                </form>
+            </div>
+            <div class="span6">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th title="Currently free processe">Free Procs</th>
+                            <th title="Average time of all currently simulated request">Avg Request Time</th>
+                            <th title="AVerage time a user has to wait for all currently simulated requests">Avg Wait Time</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td id="freeProcs">0</td>
+                            <td id="avgRequestTime">0</td>
+                            <td id="avgWaitTime">0</td>
+                        </tr>
+                    </tbody>
+                </table>
+                
+                <div id="sim"><div class="pre"><p>Sim not started</p></div></div>
+                
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th title="Amount of total simulated requests">Requests</th>
+                            <th title="Amount and percentage of requests which were timed out">Timeouts</th>
+                            <th title="The longest any request took">Longest Response Time</th>
+                            <th title="The longest a user had to wait for his response in miliseconds">Longest Wait Time ms</th>
+                            <th title="The biggest percentage added to a request due to wait">Longest Wait Time %</th>
+                            <th title="Average time a requests takes over all requests">Avg Request Time</th>
+                            <th title="The average time and percent a user has to wait">Avg Wait Time</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td id="requestCount">0</td>
+                            <td id="timeoutCount">0</td>
+                            <td id="longestRequestTime">0</td>
+                            <td id="longestWaitTime">0</td>
+                            <td id="longestWaitTimePercent">0</td>
+                            <td id="avgRequestTimeTotal">0</td>
+                            <td id="avgWaitTimeTotal">0</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+</body>
+</html>
